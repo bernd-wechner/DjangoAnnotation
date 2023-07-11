@@ -3,8 +3,8 @@ from django.db.models.aggregates import Max
 
 from DjangoAnnotation.models import Top, Middle, Lower
 
-from django.db.models import Case, Count, IntegerField, Sum, When, OuterRef, Subquery, Q
-from django.db.models.functions import Coalesce
+from django.db.models import Case, Count, IntegerField, Sum, When, OuterRef, Subquery, Q, F, Window
+from django.db.models.functions import RowNumber
 from django.db import connection
 
 import sqlparse
@@ -139,13 +139,16 @@ class Command(BaseCommand):
 
         print("Broad scope:")
 
+        expected = {}
         def test_top(top, klass=None):
             l_filter = Q(reports_to__reports_to=top)
             if not klass is None:
                 l_filter &= Q(reports_to__klass=klass)
             highest_ranks = Lower.objects.filter(l_filter).values('reports_to__reports_to', 'name').annotate(highest_rank=Max('rank')).values('highest_rank')
             sum_highest_ranks = highest_ranks.aggregate(total=Sum('highest_rank'))
-            print(f"\t\tGot sum of {sum_highest_ranks}, for {top.name} from:")
+            if not top.name in expected: expected[top.name] = {}
+            expected[top.name][klass] = sum_highest_ranks['total']
+            print(f"\t\tGot sum of {sum_highest_ranks['total']}, for {top.name} from:")
             for r in highest_ranks:
                 print(f"\t\t\t{r}")
 
@@ -157,33 +160,116 @@ class Command(BaseCommand):
         for t in Top.objects.all():
             test_top(t,2)
 
-        def test_query(klass=None, top=None):
-            if top is None:
-                l_filter = Q(reports_to__reports_to=OuterRef('id'))
-            else:
-                l_filter = Q(reports_to__reports_to=top)
-            if not klass is None:
-                l_filter &= Q(reports_to__klass=klass)
+        def test_query(klass=None, top=None, method=1):
+            if method == 1:
+                # This gets the FIRST of the MAX for some reason even though we ask for the SUM
+                # Explored here: https://stackoverflow.com/questions/76660098/annotating-a-django-queryset-with-the-sum-of-the-max-of-a-subquery
+                if top is None:
+                    l_filter = Q(reports_to__reports_to=OuterRef('id'))
+                else:
+                    l_filter = Q(reports_to__reports_to=top)
+                if not klass is None:
+                    l_filter &= Q(reports_to__klass=klass)
 
-            hr = Lower.objects.filter(l_filter).values('reports_to__reports_to', 'name').annotate(highest_rank=Max('rank')).values('highest_rank')
+                hr = Lower.objects.filter(l_filter).values('reports_to__reports_to', 'name').annotate(highest_rank=Max('rank')).values('highest_rank')
 
-            if top:
-                print(f"\t\t{top.name} drill down to highest ranks:")
-                for l in hr:
-                    print(f"\t\t\t{l}")
-            else:
-                Tops = Top.objects.annotate(high_rank_sums=Sum(Subquery(hr)))
+                if top:
+                    print(f"\t\t{top.name} drill down to highest ranks:")
+                    for l in hr:
+                        print(f"\t\t\t{l}")
+                else:
+                    Tops = Top.objects.annotate(high_rank_sums=Sum(Subquery(hr)))
 
-                for t in Tops:
-                    print(f"\t\t{t.name}, {t.high_rank_sums}")
+            elif method == 2:
+                # This works, but aaargh, Raw SQL!
+                where_klass = "" if klass is None else f'WHERE M."klass"={klass}\n'
+                query = f"""
+                    SELECT id, name, SUM(max) AS high_rank_sums
+                    FROM
+                        (SELECT T."id" AS id, T."name" AS name, MAX(L."rank") AS max
+                         FROM "DjangoAnnotation_top" T
+                         INNER JOIN "DjangoAnnotation_middle" M ON M.reports_to_id = T.id
+                         INNER JOIN "DjangoAnnotation_lower" L ON L.reports_to_id = M.id
+                         {where_klass}GROUP BY T."id",T."name", L."name")
+                    GROUP BY id, name
+                """
 
+                Tops = Top.objects.raw(query)
+
+            elif method == 3:
+                # This crashes with: django.core.exceptions.FieldError: Cannot compute Sum('max_rank'): 'max_rank' is an aggregate
+                Tops = Top.objects.annotate(max_rank=Max('middles__lowers__rank')).values('name').annotate(high_rank_sums=Sum('max_rank'))
+
+            elif method == 4:
+                # Appears to generate valid SQL that should work, but doesn't ... Odd.
+                subquery = Lower.objects.filter(reports_to__reports_to_id=OuterRef('id')).values('reports_to__id').annotate(
+                    max_rank=Max('rank')
+                ).values('max_rank')
+
+                Tops = Top.objects.annotate(high_rank_sums=Sum(Subquery(subquery)))
+
+            elif method == 5:
+                # Appears to return arbitrary values from the list of MAXs ... odd
+                subquery = Lower.objects.filter(reports_to__reports_to_id=OuterRef('id')).values('reports_to__id').annotate(
+                    max_rank=Max('rank')
+                ).values('max_rank')
+
+                Tops = Top.objects.annotate(
+                    max_rank=Subquery(subquery),
+                    high_rank_sums=Sum(
+                        Case(
+                            When(max_rank__isnull=False, then=F('max_rank')),
+                            default=0,
+                            output_field=IntegerField(),
+                        )
+                    )
+                )
+
+            elif method == 6:
+                # Bombs with: django.core.exceptions.FieldError: Cannot compute Sum('max_rank'): 'max_rank' is an aggregate
+                middle_subquery = Middle.objects.filter(reports_to=OuterRef('id')).values('id')
+
+                top_subquery = Middle.objects.filter(reports_to__in=Subquery(middle_subquery)).values('reports_to')
+
+                Tops = Top.objects.annotate(
+                    max_rank=Max('middles__lowers__rank'),
+                ).annotate(
+                    high_rank_sums=Sum('max_rank', filter=Subquery(top_subquery))
+                )
+
+            elif method == 7:
+                # Bombs on django.core.exceptions.FieldError: Unsupported lookup 'reports_to_id' for ForeignKey or join on the field not permitted.
+                middle_subquery = Middle.objects.filter(reports_to__reports_to_id=OuterRef('id')).values('reports_to__id')
+
+                Tops = Top.objects.annotate(
+                    max_rank=Max('middles__lowers__rank'),
+                    row_number=Window(
+                        expression=RowNumber(),
+                        partition_by=[F('id')],
+                        order_by=F('id').asc()
+                    )
+                ).annotate(
+                    high_rank_sums=Sum('max_rank', filter=Subquery(
+                        middle_subquery.annotate(
+                            row_number=Window(expression=RowNumber(), order_by=F('max_rank').desc())
+                        ).filter(row_number=1).values('max_rank')
+                    ))
+                )
+
+            # print(f"\t\tExpecting:")
+            # for t in Tops:
+            #     print(f"\t\t\t{t.name}, {expected[t.name][klass]}")
+
+            print(f"\t\tProduced:")
+            for t in Tops:
+                status = "PASS" if  t.high_rank_sums == expected[t.name][klass] else "FAIL"
+                print(f"\t\t\t{t.name}, {t.high_rank_sums} expected {expected[t.name][klass]}    {status}")
+
+
+        method = 2
         print("\tTrying a Queryset (no klass)")
-        test_query()
+        test_query( method=method)
 
         print("\tTrying a Queryset (klass 2)")
-        test_query(2, Top.objects.get(name="Jill Tuley"))
-        test_query(2)
-
-
-
-
+        #test_query(2, Top.objects.get(name="Jill Tuley"))
+        test_query(2, method=method)
