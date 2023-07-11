@@ -18,7 +18,7 @@ The annotations are tested in the management command [annotate](https://github.c
 
 `python manage.py annotate`
 
-Requirements are in [requirements.txt](https://github.com/bernd-wechner/DjangoAnnotation/blob/main/requirements.txt). Typically you's gets started by installing that in a [venv](https://docs.python.org/3/library/venv.html).
+Requirements are in [requirements.txt](https://github.com/bernd-wechner/DjangoAnnotation/blob/main/requirements.txt). Typically you'd gets started by installing that in a [venv](https://docs.python.org/3/library/venv.html), something like this (on a *nix system, slightly different on Windows):
 
 ```
 $ python -m venv my_venv_dir
