@@ -74,7 +74,7 @@ def get_SQL(queryset, explain=False, pretty=True):
 def print_SQL(queryset, explain=False, pretty=True):
     '''
     A trivial wrapper around get_SQL that simply prints the result. Useful primarily in a debugger say, to
-    produce a SQL straing htat can be copied/ and pasted into a Query Tool. That is, it doesn't have quotes
+    produce a SQL string that can be copied and pasted into a Query Tool. That is, it doesn't have quotes
     around it for example.
 
     :param queryset: A Django QuerySet
